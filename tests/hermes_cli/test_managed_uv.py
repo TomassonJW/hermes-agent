@@ -489,6 +489,70 @@ class TestManagedPythonStore:
 
 
 class TestRuntimeRepair:
+    def test_dot_venv_install_is_targeted_when_venv_missing(self, tmp_path):
+        """A ``.venv`` checkout linking vulnerable SQLite must be repairable.
+
+        Historically only ``venv`` was probed, so ``.venv`` installs
+        returned not-applicable forever and stayed on journal_mode=DELETE.
+        """
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root = tmp_path / "checkout"
+        root.mkdir()
+        (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        live = root / ".venv"
+        (live / "bin").mkdir(parents=True)
+        python = live / "bin" / "python"
+        python.write_text("live interpreter", encoding="utf-8")
+
+        current = _runtime_info(python, (3, 50, 4))
+        probed = []
+
+        def fake_probe(target, **kwargs):
+            probed.append(Path(target))
+            return current
+
+        with patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
+             patch(
+                 "hermes_cli.managed_uv.probe_sqlite_runtime",
+                 side_effect=fake_probe,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._install_safe_python_generation",
+                 return_value=None,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._refresh_managed_uv_catalog",
+                 return_value=False,
+             ):
+            result = repair_vulnerable_runtime("uv", project_root=root)
+
+        # The .venv interpreter was probed (not skipped as not-applicable) and
+        # the repair pipeline actually engaged for it.
+        assert result.status == "failed"
+        assert probed and probed[0] == python
+        assert result.sqlite_before == "3.50.4"
+
+    def test_venv_wins_over_dot_venv_when_both_exist(self, tmp_path):
+        from hermes_cli.managed_uv import _default_live_venv
+
+        root, live, _sentinel = _make_runtime_install(tmp_path)
+        alt = root / ".venv"
+        (alt / "bin").mkdir(parents=True)
+        (alt / "bin" / "python").write_text("alt interpreter", encoding="utf-8")
+
+        assert _default_live_venv(root) == live
+
+    def test_no_interpreter_anywhere_stays_not_applicable(self, tmp_path):
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root = tmp_path / "checkout"
+        root.mkdir()
+        (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+        result = repair_vulnerable_runtime("uv", project_root=root)
+        assert result.status == "not-applicable"
+
     def test_safe_runtime_is_a_noop(self, tmp_path):
         from hermes_cli.managed_uv import repair_vulnerable_runtime
 
