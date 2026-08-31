@@ -1354,6 +1354,191 @@ def _assess_parked_branch_switch(
     return True, ""
 
 
+# Cap the remote-tracking reflog walk. A force-push is recent by nature, so
+# the answer is always within the newest few entries; the bound keeps a long
+# reflog from turning one update into hundreds of git invocations.
+_REFLOG_LOOKBACK_LIMIT = 50
+
+
+def _plan_diverged_target_update(
+    git_cmd: list[str], cwd: Path, branch: str
+) -> tuple[str, int]:
+    """Decide how to recover when HEAD and ``origin/<branch>`` have diverged
+    ON THE UPDATE TARGET BRANCH ITSELF.
+
+    Live incident (2026-08-31): a checkout sitting on ``main`` carried two
+    local-only commits. ``git merge --ff-only`` failed, the updater assumed an
+    upstream force-push and ran ``git reset --hard origin/main`` — destroying
+    both commits. Only the reflog saved them.
+
+    The parked-branch path already merges instead of resetting "so local
+    commits survive"; it simply never ran for work committed on the target
+    branch. This planner closes that gap by asking git one question: does HEAD
+    carry commits whose patches are not already in ``origin/<branch>``?
+
+    Returns ``(action, local_commit_count)``:
+
+    - ``("merge", n)`` — n local commits would be lost by a reset. Merge
+      instead: it preserves them, and a conflict stops the update cleanly.
+      Also returned when the comparison cannot be read: an unverifiable state
+      is exactly when a destructive reset is least defensible.
+    - ``("reset", 0)`` — nothing local to lose (true upstream force-push or
+      patches already landed upstream), so the original hard-reset recovery
+      still applies.
+
+    Distinguishing the two is the whole job, because ``git cherry`` alone
+    cannot: after an upstream force-push the abandoned commits look exactly
+    like local work ('+' lines). The discriminator is the remote-tracking
+    reflog — if HEAD is contained in a PREVIOUS value of ``origin/<branch>``,
+    those commits were published by upstream and merely rewritten, so nothing
+    local is lost by resetting. Genuine local work is never reachable from any
+    historical remote value.
+    """
+    cherry = subprocess.run(
+        git_cmd + ["cherry", f"origin/{branch}"],
+        cwd=cwd, capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if cherry.returncode != 0:
+        # Unverifiable: fail safe toward preserving work.
+        return "merge", 0
+    local_only = [
+        line for line in cherry.stdout.splitlines() if line.startswith("+")
+    ]
+    if not local_only:
+        return "reset", 0
+    if _head_came_from_upstream(git_cmd, cwd, branch):
+        return "reset", 0
+    return "merge", len(local_only)
+
+
+def _head_came_from_upstream(
+    git_cmd: list[str], cwd: Path, branch: str
+) -> bool:
+    """True when HEAD is reachable from a past value of ``origin/<branch>``.
+
+    Used to tell an upstream force-push (HEAD is an abandoned upstream commit —
+    safe to reset away) from genuine local work (never reachable from any
+    historical remote value — must be preserved). Returns False on any git
+    failure so the caller falls back to the non-destructive path.
+    """
+    reflog = subprocess.run(
+        git_cmd + ["reflog", "show", "--format=%H", f"origin/{branch}"],
+        cwd=cwd, capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if reflog.returncode != 0:
+        return False
+    # ``reflog show`` prints each entry's NEW value; the pre-force-push value
+    # lives one step further back, reachable only through the ``@{n}``
+    # selector — so walk the selectors, not the printed shas. ``n`` runs one
+    # past the entry count to reach the oldest entry's own previous value.
+    entries = len([line for line in reflog.stdout.splitlines() if line.strip()])
+    for step in range(min(entries, _REFLOG_LOOKBACK_LIMIT) + 1):
+        contained = subprocess.run(
+            git_cmd
+            + [
+                "merge-base",
+                "--is-ancestor",
+                "HEAD",
+                f"origin/{branch}@{{{step}}}",
+            ],
+            cwd=cwd, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if contained.returncode == 0:
+            return True
+    return False
+
+
+def _recover_diverged_checkout(
+    git_cmd: list[str], cwd: Path, branch: str
+) -> str:
+    """Recover the checkout after ``git merge --ff-only origin/<branch>`` failed.
+
+    ff-only failing means local and remote have diverged. Before assuming an
+    upstream force-push, check WHY: a checkout on a custom branch (local
+    commits on top of origin/<branch>) also cannot fast-forward, and so can
+    the target branch itself when it carries local commits. ``reset --hard``
+    in either case silently discards that work (2026-08-31 incident: two local
+    commits on ``main`` destroyed, recoverable only from the reflog).
+
+    Merges when anything local would be lost and stops cleanly on conflict;
+    resets only when there is provably nothing to lose. Returns the action
+    taken (``"merged"`` / ``"reset"``) and exits the process on failure, as
+    the update cannot continue on a half-recovered checkout.
+    """
+    cur_branch = (
+        subprocess.run(
+            git_cmd + ["branch", "--show-current"],
+            cwd=cwd, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        ).stdout
+        or ""
+    ).strip()
+    on_target_branch = not (cur_branch and cur_branch != branch)
+    if on_target_branch:
+        action, local_commits = _plan_diverged_target_update(git_cmd, cwd, branch)
+    else:
+        action, local_commits = "merge", 0
+
+    if action == "merge":
+        if on_target_branch:
+            print(
+                f"  ⚠ Branch '{branch}' carries {local_commits} local "
+                f"commit(s) not upstream — merging origin/{branch} "
+                "instead of resetting so they survive..."
+            )
+        else:
+            print(
+                f"  ⚠ Checkout is on custom branch '{cur_branch}' — "
+                f"merging origin/{branch} instead of resetting so local commits survive..."
+            )
+        # Best-effort safety tag; recovery anchor if anything goes wrong.
+        subprocess.run(
+            git_cmd + ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"],
+            cwd=cwd, capture_output=True, check=False,
+        )
+        merge_result = subprocess.run(
+            git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
+            cwd=cwd, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if merge_result.returncode != 0:
+            subprocess.run(
+                git_cmd + ["merge", "--abort"],
+                cwd=cwd, capture_output=True, check=False,
+            )
+            print(
+                "✗ Merge conflict between local commits and upstream — "
+                "update stopped, nothing was changed."
+            )
+            print(f"  Resolve manually: cd {cwd} && git merge origin/{branch}")
+            print("  Then re-run the update. Local work is untouched.")
+            sys.exit(1)
+        return "merged"
+
+    # Nothing local to lose — a true upstream force-push/rebase. Local changes
+    # are already stashed; reset to match the remote exactly.
+    print(
+        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+    )
+    reset_result = subprocess.run(
+        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+        cwd=cwd, capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if reset_result.returncode != 0:
+        print(f"✗ Failed to reset to origin/{branch}.")
+        if reset_result.stderr.strip():
+            print(f"  {reset_result.stderr.strip()}")
+        print(
+            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+        )
+        sys.exit(1)
+    return "reset"
+
+
 def _print_parked_branch_skip_warning(
     git_cmd: list[str],
     cwd: Path,
@@ -8090,80 +8275,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged. Before
-                # assuming an upstream force-push, check WHY: a checkout on a
-                # custom branch (local commits on top of origin/<branch>) also
-                # cannot fast-forward, and `reset --hard` here would silently
-                # discard that work. Merge instead and stop cleanly on
-                # conflict — an update must never destroy local commits.
-                _cur_branch = (
-                    subprocess.run(
-                        git_cmd + ["branch", "--show-current"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    ).stdout
-                    or ""
-                ).strip()
-                if _cur_branch and _cur_branch != branch:
-                    print(
-                        f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
-                        f"merging origin/{branch} instead of resetting so local commits survive..."
-                    )
-                    # Best-effort safety tag; recovery anchor if anything goes wrong.
-                    subprocess.run(
-                        git_cmd
-                        + ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        check=False,
-                    )
-                    merge_result = subprocess.run(
-                        git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if merge_result.returncode != 0:
-                        subprocess.run(
-                            git_cmd + ["merge", "--abort"],
-                            cwd=_m().PROJECT_ROOT,
-                            capture_output=True,
-                            check=False,
-                        )
-                        print(
-                            "✗ Merge conflict between local commits and upstream — "
-                            "update stopped, nothing was changed."
-                        )
-                        print(
-                            f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
-                            f"git merge origin/{branch}"
-                        )
-                        print(
-                            "  Then re-run the update. Local work is untouched."
-                        )
-                        sys.exit(1)
-                else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
-                    print(
-                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                    )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
-                        if reset_result.stderr.strip():
-                            print(f"  {reset_result.stderr.strip()}")
-                        print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                        )
-                        sys.exit(1)
+                _recover_diverged_checkout(git_cmd, _m().PROJECT_ROOT, branch)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
