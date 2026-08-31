@@ -541,6 +541,21 @@ def _resolve_runtime_from_pool_entry(
             if not _anthropic_base_url_override_ok(cfg_base_url):
                 cfg_base_url = ""
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
+        source = str(getattr(entry, "source", "") or "")
+        if source in {
+            "env:ANTHROPIC_TOKEN",
+            "env:CLAUDE_CODE_OAUTH_TOKEN",
+        } and base_url_hostname(base_url) == "api.anthropic.com":
+            from agent.anthropic_adapter import resolve_anthropic_token
+
+            preferred = resolve_anthropic_token(allow_pool_fallback=False)
+            if not preferred:
+                raise AuthError(
+                    "No usable Anthropic credentials found for env-backed pool entry.",
+                    provider="anthropic",
+                    code="missing_api_key",
+                )
+            api_key = preferred
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "xai":

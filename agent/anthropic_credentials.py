@@ -786,7 +786,7 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
-def resolve_anthropic_token() -> Optional[str]:
+def resolve_anthropic_token(*, allow_pool_fallback: bool = True) -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
     Priority:
@@ -796,6 +796,11 @@ def resolve_anthropic_token() -> Optional[str]:
       4. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
          — with automatic refresh if expired and a refresh token is available
       5. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
+
+    ``allow_pool_fallback=False`` is for re-resolving a token that already
+    came from a borrowed pool row. It prevents a missing live source from
+    circling back to the same persisted snapshot while preserving the
+    historical default for normal initial resolution.
 
     Returns the token string or None.
     """
@@ -836,10 +841,13 @@ def resolve_anthropic_token() -> Optional[str]:
     if resolved_claude_token:
         return resolved_claude_token
 
-    # 5. Hermes credential_pool OAuth entry.
-    resolved_pool_token = _resolve_anthropic_pool_token()
-    if resolved_pool_token:
-        return resolved_pool_token
+    # 5. Hermes credential_pool OAuth entry. Re-resolution callers can
+    # exclude this fallback when the token being replaced already came from
+    # that pool, avoiding a circular return of the same orphaned snapshot.
+    if allow_pool_fallback:
+        resolved_pool_token = _resolve_anthropic_pool_token()
+        if resolved_pool_token:
+            return resolved_pool_token
 
     return None
 

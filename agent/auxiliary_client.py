@@ -4105,8 +4105,10 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         return None, None
 
     pool_present, entry = _select_pool_entry("anthropic")
+    source = ""
     if pool_present and entry is not None:
         token = explicit_api_key or _pool_runtime_api_key(entry)
+        source = str(getattr(entry, "source", "") or "")
     else:
         # Pool absent, OR pool present but no usable entry (expired token +
         # stale refresh_token, all entries exhausted, etc). Fall through to the
@@ -4119,9 +4121,9 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         # "no auxiliary client configured" while the main session stayed
         # healthy (it resolves the env token directly).
         entry = None
-        token = explicit_api_key or resolve_anthropic_token()
-    if not token:
-        return None, None
+        token = explicit_api_key or resolve_anthropic_token(
+            allow_pool_fallback=not pool_present,
+        )
 
     # Allow base URL override from config.yaml model.base_url, but only when:
     #   1. the configured provider is anthropic (otherwise a non-Anthropic
@@ -4146,6 +4148,20 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
                     base_url = cfg_base_url
     except Exception:
         pass
+
+    if (
+        pool_present
+        and entry is not None
+        and not explicit_api_key
+        and source in {
+            "env:ANTHROPIC_TOKEN",
+            "env:CLAUDE_CODE_OAUTH_TOKEN",
+        }
+        and base_url_hostname(base_url) == "api.anthropic.com"
+    ):
+        token = resolve_anthropic_token(allow_pool_fallback=False)
+    if not token:
+        return None, None
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
@@ -5140,7 +5156,7 @@ def _refresh_provider_credentials(provider: str) -> bool:
             creds = read_claude_code_credentials()
             token = _refresh_oauth_token(creds) if isinstance(creds, dict) and creds.get("refreshToken") else None
             if not str(token or "").strip():
-                token = resolve_anthropic_token()
+                token = resolve_anthropic_token(allow_pool_fallback=False)
             if not str(token or "").strip():
                 return False
             _evict_cached_clients(normalized)
@@ -5182,6 +5198,8 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
     except Exception as exc:
+        if normalized == "anthropic":
+            raise
         logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
     return False
@@ -6152,6 +6170,30 @@ def _resolve_single_provider(
     )
     return client
 
+def _should_reresolve_inherited_anthropic_token(
+    provider: str,
+    base_url: str,
+    api_key: Any,
+) -> bool:
+    """Return True for a rotating main-runtime OAuth snapshot.
+
+    ``main_runtime.api_key`` is an observation of the credential that was
+    current when the chat runtime was bound.  Treating that snapshot as an
+    explicit per-call key prevents Anthropic auxiliaries from seeing a later
+    OAuth refresh.  Only native Anthropic traffic on the exact official host
+    may delegate back to the canonical resolver; API keys and custom endpoints
+    remain authoritative.
+    """
+    if _normalize_aux_provider(provider) != "anthropic" or not api_key:
+        return False
+    effective_base_url = str(base_url or _ANTHROPIC_DEFAULT_BASE_URL).strip()
+    if base_url_hostname(effective_base_url) != "api.anthropic.com":
+        return False
+    from agent.anthropic_adapter import _is_oauth_token
+
+    return _is_oauth_token(str(api_key))
+
+
 def _resolve_auto_route(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
@@ -6284,10 +6326,16 @@ def _resolve_auto_route(
             elif runtime_api_key:
                 explicit_api_key = runtime_api_key
         elif runtime_api_key:
-            # Pin auxiliary to the same api_key as the active main chat session
-            # so that a working key is reused instead of re-selecting from the pool
-            # (which might pick a different, potentially exhausted key).
-            explicit_api_key = runtime_api_key
+            # Reuse durable API keys, but never pin a rotating Anthropic OAuth
+            # snapshot copied from the main runtime. On the official endpoint
+            # the provider resolver owns freshness; passing the snapshot as an
+            # explicit key would bypass it. Custom endpoints remain untouched.
+            if not _should_reresolve_inherited_anthropic_token(
+                main_provider,
+                runtime_base_url,
+                runtime_api_key,
+            ):
+                explicit_api_key = runtime_api_key
         # Skip Step-1 if the main provider was recently 402'd. The unhealthy
         # cache TTL bounds how long we bypass it, so a topped-up account
         # recovers automatically. If we tried Step-1 anyway, every aux call
@@ -8250,11 +8298,23 @@ def _get_cached_client(
     # the env var and fail again, causing the retry2_err handler to mark key #2.
     effective_api_key = api_key
     if not effective_api_key:
-        _pe = _peek_pool_entry(_normalize_aux_provider(provider))
+        normalized_provider = _normalize_aux_provider(provider)
+        _pe = _peek_pool_entry(normalized_provider)
         if _pe is not None:
-            _pk = _pool_runtime_api_key(_pe)
-            if _pk:
-                effective_api_key = _pk
+            pool_source = str(getattr(_pe, "source", "") or "").strip()
+            pool_base_url = base_url or _pool_runtime_base_url(
+                _pe, _ANTHROPIC_DEFAULT_BASE_URL
+            )
+            reresolve_anthropic_snapshot = (
+                normalized_provider == "anthropic"
+                and pool_source
+                in {"env:ANTHROPIC_TOKEN", "env:CLAUDE_CODE_OAUTH_TOKEN"}
+                and base_url_hostname(pool_base_url) == "api.anthropic.com"
+            )
+            if not reresolve_anthropic_snapshot:
+                _pk = _pool_runtime_api_key(_pe)
+                if _pk:
+                    effective_api_key = _pk
     client, default_model = resolve_provider_client(
         provider,
         model,
