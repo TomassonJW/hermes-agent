@@ -614,7 +614,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _exec_inject = any(p in model_lower for p in EXECUTION_GUIDANCE_MODELS)
         if _exec_inject:
             from agent.prompt_builder import execution_guidance_text
-            stable_parts.append(execution_guidance_text(agent.valid_tool_names))
+            stable_parts.append(
+                execution_guidance_text(agent.valid_tool_names, model=agent.model)
+            )
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
