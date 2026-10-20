@@ -58,7 +58,17 @@ export function bindReceiptUserRows(messages: ChatMessage[], receipt: PersistedT
       : messages.findLastIndex(message => {
           const rows = transcriptRowIds(message)
 
-          return rows.length > 0 && !rows.some(id => turnRows.has(id))
+          // A finished live reply whose receipt was lost is still a turn
+          // boundary, including assistant-<time> completions that arrived
+          // without any deltas. Otherwise a background completion with no
+          // on-screen opener can steal that earlier prompt. The completing
+          // reply was just stamped with this receipt; interims are not boundaries.
+          return rows.length
+            ? !rows.some(id => turnRows.has(id))
+            : message.role === 'assistant' &&
+                message.pending !== true &&
+                message.interim !== true &&
+                message.persistedTurn !== receipt
         }) + 1
 
   const candidates = messages.flatMap((message, index) => (index >= start && isTurnUserBubble(message) ? [index] : []))

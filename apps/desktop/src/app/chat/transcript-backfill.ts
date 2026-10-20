@@ -26,6 +26,8 @@ import {
 } from '@/store/transcript-tail'
 import type { SessionMessage, SessionMessagesResponse } from '@/types/hermes'
 
+import { durableRowIds, mergeOverlappingTail } from './transcript-overlap'
+
 /**
  * Compaction projection can stamp the session's opening USER row
  * `display_kind: hidden` (#96875): the durable store holds the greeting but
@@ -212,10 +214,6 @@ function pageCoversWindow(previous: ChatMessage[], refreshedIds: Set<string>, re
   )
 }
 
-function durableRowIds(messages: ChatMessage[]): Set<number> {
-  return new Set(messages.flatMap(message => (message.rowId === undefined ? [] : [message.rowId])))
-}
-
 /** A text-only refresh can omit the live tool bubble after the turn settles. */
 function retainCompletedTurnTools(messages: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {
   const previousFinalIndex = previous.findLastIndex(
@@ -280,102 +278,6 @@ function retainCompletedTurnTools(messages: ChatMessage[], previous: ChatMessage
   return messages.map((message, index) =>
     index === finalIndex ? { ...message, parts: [...missing, ...message.parts] } : message
   )
-}
-
-function sharesDurableRow(first: ChatMessage[], second: ChatMessage[]): boolean {
-  const rowIds = durableRowIds(first)
-
-  return second.some(message => message.rowId !== undefined && rowIds.has(message.rowId))
-}
-
-interface StoredRowSlot {
-  message: ChatMessage
-  /** Rows without a stored id (e.g. a page-local tool fold) that precede this row. */
-  leading: ChatMessage[]
-}
-
-/**
- * Stored-id merge for a page that overlaps the window but does not anchor in
- * front of it. A row with no stored id travels with the next stored row after
- * it, so a page-local fold stays in front of the row it preceded. Rows with no
- * stored id after the last stored row stay at the end (page first, then live).
- */
-function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessage[]): ChatMessage[] {
-  // Compaction, rewind, or a different session arrives as new stored ids.
-  // This function is the path that puts that page on screen.
-  if (!sharesDurableRow(previous, refreshedTail)) {
-    return refreshedTail
-  }
-
-  const refreshedIds = new Set(refreshedTail.map(message => message.id))
-  const refreshedBySource = new Map<number, ChatMessage>()
-
-  for (const message of refreshedTail) {
-    for (const rowId of transcriptRowIds(message)) {
-      refreshedBySource.set(rowId, message)
-    }
-  }
-
-  const byRowId = new Map<number, StoredRowSlot>()
-
-  const place = (messages: ChatMessage[], fresh: boolean): ChatMessage[] => {
-    let pending: ChatMessage[] = []
-
-    for (const message of messages) {
-      const sourceIds = transcriptRowIds(message)
-      const folded = sourceIds.length ? refreshedBySource.get(sourceIds[0]) : undefined
-
-      // A completed live reply is addressed by its final row; hydration can
-      // fold that row into an earlier tool bubble. Give both the fold's slot,
-      // so the fresh copy replaces the live one without losing its leading rows.
-      // Partial/live bubbles may still hold an uncommitted suffix.
-      const covered =
-        !fresh &&
-        !message.pending &&
-        !message.interim &&
-        !message.error &&
-        message.durableComplete !== false &&
-        message.persistedTurn?.complete !== false &&
-        folded?.role === message.role &&
-        sourceIds.every(id => refreshedBySource.get(id) === folded)
-
-      const rowId = covered ? (folded?.rowId ?? message.rowId) : message.rowId
-
-      if (rowId === undefined) {
-        // The fresh page's copy of an unstored row wins over the window's.
-        if (fresh || !refreshedIds.has(message.id)) {
-          pending.push(message)
-        }
-
-        continue
-      }
-
-      const existing = byRowId.get(rowId)
-
-      if (!fresh && existing) {
-        pending = []
-
-        continue
-      }
-
-      // The fresh page replaces the row; keep the window's leading rows when
-      // the page brought none of its own for it.
-      const leading = fresh && existing && pending.length === 0 ? existing.leading : pending
-      byRowId.set(rowId, { message, leading })
-      pending = []
-    }
-
-    return pending
-  }
-
-  const previousTrailing = place(previous, false)
-  const refreshedTrailing = place(refreshedTail, true)
-
-  const stored = [...byRowId.entries()]
-    .sort((left, right) => left[0] - right[0])
-    .flatMap(([, { leading, message }]) => [...leading, message])
-
-  return [...stored, ...refreshedTrailing, ...previousTrailing]
 }
 
 export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {
