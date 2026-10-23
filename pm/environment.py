@@ -260,6 +260,10 @@ def managed_environment(destination: Path, *, python: Path | None = None,
     uv, pinned_python = tools
     python = pinned_python if python is None else python.absolute()
     build_env = _base_environment(env)
+    if python.resolve() == pinned_python.resolve():
+        from pm.native_build import pinned_compiler_overrides
+
+        build_env.update(pinned_compiler_overrides(python, build_env))
     if sys.platform == "darwin" and python.resolve() == pinned_python.resolve():
         # PBS's AR still names its deleted build directory. Its CC is already
         # clang; only the archiver needs a default, and only for our interpreter.
